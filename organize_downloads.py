@@ -130,21 +130,25 @@ def _ensure_dir(path, dry_run=False):
 def _move_file(src, dst_dir, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY):
     dst = Path(dst_dir) / src.name
     conflict_action = None
+    backup_path = None
 
     if Path(src).resolve() == dst.resolve():
-        return 0, str(src), conflict_action
+        return 0, str(src), conflict_action, backup_path
 
     if dst.exists():
         if conflict_strategy == "skip":
-            print(f"  {'[DRY-RUN] 将' if dry_run else ''}跳过(冲突): {src.name}")
-            return 0, str(src), "skip"
+            label = "[DRY-RUN] 将" if dry_run else ""
+            print(f"  {label}跳过(冲突): {src.name}")
+            return 0, str(src), "skip", None
         elif conflict_strategy == "overwrite_backup":
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             bak = dst.parent / f"{dst.stem}.bak_{ts}{dst.suffix}"
-            print(f"  {'[DRY-RUN] 将' if dry_run else ''}备份: {dst.name} -> {bak.name}")
+            label = "[DRY-RUN] 将" if dry_run else ""
+            print(f"  {label}备份: {dst.name} -> {bak.parent.name}/{bak.name}")
             if not dry_run:
                 shutil.move(str(dst), str(bak))
             conflict_action = "overwrite_backup"
+            backup_path = str(bak)
         else:
             stem = dst.stem
             suffix = dst.suffix
@@ -163,7 +167,7 @@ def _move_file(src, dst_dir, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEG
 
     if not dry_run:
         shutil.move(str(src), str(dst))
-    return size, str(dst), conflict_action
+    return size, str(dst), conflict_action, backup_path
 
 
 def _format_size(size_bytes):
@@ -194,7 +198,8 @@ def _cleanup_empty_dirs(root, dry_run):
         if not empty_dirs:
             break
         for d in empty_dirs:
-            print(f"  {'[DRY-RUN] 将' if dry_run else ''}删除空文件夹: {d}")
+            label = "[DRY-RUN] 将" if dry_run else ""
+            print(f"  {label}删除空文件夹: {d}")
             if not dry_run:
                 try:
                     d.rmdir()
@@ -214,7 +219,7 @@ def _check_dir_exists(path):
 
 
 # ============================================================
-#  预测空目录 — 模拟移动后哪些目录会变空
+#  预测空目录
 # ============================================================
 
 def _predict_empty_dirs(root, category_names, moved_sources):
@@ -234,7 +239,6 @@ def _predict_empty_dirs(root, category_names, moved_sources):
             dir_hierarchy[parent].add(d)
             parent = parent.parent
 
-    empty_after_move = set()
     fully_moved = set()
     for d, files in dir_files_map.items():
         if files and files.issubset(moved_set):
@@ -276,19 +280,23 @@ def _predict_empty_dirs(root, category_names, moved_sources):
 def _load_md5_cache(root):
     cache_path = Path(root) / MD5_CACHE_FILENAME
     if not cache_path.exists():
-        return {}
+        return {}, {"hits": 0, "misses": 0, "bytes_saved": 0}
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
     except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+        return {}, {"hits": 0, "misses": 0, "bytes_saved": 0}
+
+    if isinstance(data, dict):
+        stats = data.pop("__stats__", {"hits": 0, "misses": 0, "bytes_saved": 0})
+        return data, stats
+    return {}, {"hits": 0, "misses": 0, "bytes_saved": 0}
 
 
-def _save_md5_cache(root, cache):
+def _save_md5_cache(root, cache, stats=None):
     cache_path = Path(root) / MD5_CACHE_FILENAME
+    if stats is not None:
+        cache["__stats__"] = stats
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
@@ -319,6 +327,100 @@ def _clean_stale_cache(cache):
             stale.append(path_str)
     for s in stale:
         del cache[s]
+    return len(stale)
+
+
+# ============================================================
+#  缓存维护
+# ============================================================
+
+def cache_stats(root, detail=False):
+    cache, cache_stats_data = _load_md5_cache(root)
+    cache_path = Path(root) / MD5_CACHE_FILENAME
+
+    if not cache:
+        print("MD5 缓存为空。")
+        return
+
+    total = len(cache)
+    stale_count = sum(1 for p in cache if not _check_dir_exists(p))
+    total_size = cache_path.stat().st_size if cache_path.exists() else 0
+    cached_sizes = sum(e.get("size", 0) for e in cache.values())
+
+    total_hits = cache_stats_data.get("hits", 0)
+    total_misses = cache_stats_data.get("misses", 0)
+    bytes_saved = cache_stats_data.get("bytes_saved", 0)
+    total_ops = total_hits + total_misses
+    hit_rate = (total_hits / total_ops * 100) if total_ops > 0 else 0
+
+    print("=" * 50)
+    print("MD5 缓存统计")
+    print("=" * 50)
+    print(f"  缓存条目:     {total}")
+    print(f"  失效条目:     {stale_count}")
+    print(f"  有效条目:     {total - stale_count}")
+    print(f"  缓存文件大小: {_format_size(total_size)}")
+    print(f"  缓存覆盖文件: {_format_size(cached_sizes)}")
+    print("-" * 50)
+    print("累计命中统计:")
+    print(f"  累计命中:     {total_hits} 次")
+    print(f"  累计重算:     {total_misses} 次")
+    print(f"  命中率:       {hit_rate:.1f}%")
+    print(f"  省去重复计算: {_format_size(bytes_saved)}")
+    print("=" * 50)
+
+    if detail:
+        print()
+        print("缓存详情:")
+        for path_str, entry in sorted(cache.items()):
+            name = Path(path_str).name
+            exists = _check_dir_exists(path_str)
+            status = "" if exists else " [失效]"
+            print(f"  {name}{status}  MD5={entry.get('md5', '?')[:12]}...  "
+                  f"{_format_size(entry.get('size', 0))}")
+
+
+def cache_clean(root):
+    cache, cache_stats_data = _load_md5_cache(root)
+    if not cache:
+        print("MD5 缓存为空，无需清理。")
+        return
+
+    removed = _clean_stale_cache(cache)
+    _save_md5_cache(root, cache, cache_stats_data)
+    print(f"缓存清理完成: 移除 {removed} 条失效条目, 剩余 {len(cache)} 条")
+
+
+def cache_rebuild(root):
+    root = Path(root)
+    cache_path = root / MD5_CACHE_FILENAME
+    if cache_path.exists():
+        cache_path.unlink()
+
+    categories, _ = load_config(None) if yaml else (DEFAULT_CATEGORIES, [])
+    if yaml is None:
+        categories = DEFAULT_CATEGORIES
+
+    category_names = set(categories.keys()) | {"Others", "Duplicates"}
+    category_dirs = {}
+    for cat in sorted(category_names):
+        if cat == "Duplicates":
+            continue
+        category_dirs[cat] = root / cat
+
+    existing_files = _scan_existing_category_files(root, category_dirs)
+    cache = {}
+    for path_str, file_path in sorted(existing_files.items()):
+        md5 = _compute_md5(file_path)
+        if md5:
+            try:
+                stat = file_path.stat()
+                cache[path_str] = {"md5": md5, "size": stat.st_size, "mtime": stat.st_mtime}
+            except OSError:
+                pass
+
+    _save_md5_cache(root, cache, {"hits": 0, "misses": 0, "bytes_saved": 0})
+    print(f"缓存重建完成: {len(cache)} 个文件已索引")
 
 
 # ============================================================
@@ -338,10 +440,11 @@ def _scan_existing_category_files(root, category_dirs):
 
 
 def _build_existing_md5_index(existing_files, root):
-    cache = _load_md5_cache(root)
+    cache, cache_stats_data = _load_md5_cache(root)
     index = {}
     cache_hits = 0
     cache_misses = 0
+    bytes_saved = 0
 
     for path_str, file_path in sorted(existing_files.items()):
         md5, is_hit = _get_md5_cached(file_path, cache)
@@ -349,13 +452,19 @@ def _build_existing_md5_index(existing_files, root):
             continue
         if is_hit:
             cache_hits += 1
+            entry_size = cache.get(path_str, {}).get("size", 0)
+            bytes_saved += entry_size
         else:
             cache_misses += 1
         if md5 not in index:
             index[md5] = file_path
 
     _clean_stale_cache(cache)
-    _save_md5_cache(root, cache)
+
+    cache_stats_data["hits"] = cache_stats_data.get("hits", 0) + cache_hits
+    cache_stats_data["misses"] = cache_stats_data.get("misses", 0) + cache_misses
+    cache_stats_data["bytes_saved"] = cache_stats_data.get("bytes_saved", 0) + bytes_saved
+    _save_md5_cache(root, cache, cache_stats_data)
 
     if cache_hits + cache_misses > 0:
         print(f"  MD5 缓存: {cache_hits} 命中, {cache_misses} 重算, 共 {len(index)} 个唯一文件")
@@ -480,12 +589,6 @@ def _append_history_entry(root, ts, stats, report_base, log_backup_path,
                           retention_count=None, retention_days=None):
     entries = _load_history(root)
 
-    entries, expired = _prune_history(root, entries, retention_count, retention_days)
-    _cleanup_expired_history(root, expired)
-
-    if expired:
-        print(f"历史清理: 移除了 {len(expired)} 条过期记录")
-
     next_index = max((e["index"] for e in entries), default=0) + 1
     entry = {
         "index": next_index,
@@ -497,6 +600,13 @@ def _append_history_entry(root, ts, stats, report_base, log_backup_path,
         "log_backup": str(log_backup_path) if log_backup_path else None,
     }
     entries.append(entry)
+
+    entries, expired = _prune_history(root, entries, retention_count, retention_days)
+    _cleanup_expired_history(root, expired)
+
+    if expired:
+        print(f"历史清理: 移除了 {len(expired)} 条过期记录")
+
     _save_history(root, entries)
 
 
@@ -552,7 +662,132 @@ def _find_history_entry(entries, index):
 
 
 # ============================================================
-#  分析阶段 — 与执行完全分离
+#  健康检查
+# ============================================================
+
+def health_check(root, clean=False):
+    issues = []
+
+    entries = _load_history(root)
+    history_by_report = {}
+    history_by_log = {}
+    for e in entries:
+        rb = e.get("report_base", "")
+        if rb:
+            history_by_report[rb] = e
+        lb = e.get("log_backup", "")
+        if lb:
+            history_by_log[lb] = e
+
+    # 检查历史引用的报告是否存在
+    for report_base, e in history_by_report.items():
+        for ext in [".json", ".md"]:
+            p = Path(f"{report_base}{ext}")
+            if not p.exists():
+                issues.append({
+                    "type": "broken_report_link",
+                    "detail": f"历史记录 [{e['index']}] 引用的报告不存在: {p.name}",
+                    "path": str(p),
+                })
+
+    # 检查历史引用的日志是否存在
+    for log_path, e in history_by_log.items():
+        lp = Path(log_path)
+        if not lp.exists():
+            issues.append({
+                "type": "broken_log_link",
+                "detail": f"历史记录 [{e['index']}] 引用的日志不存在: {lp.name}",
+                "path": log_path,
+            })
+
+    # 检查磁盘上的报告是否有对应的历史记录
+    found_report_bases = set()
+    for p in Path(root).glob("organize_report_*.json"):
+        report_base = str(p.with_suffix(""))
+        found_report_bases.add(report_base)
+        if report_base not in history_by_report:
+            issues.append({
+                "type": "orphan_report",
+                "detail": f"磁盘上的报告无对应历史记录: {p.name}",
+                "path": str(p),
+            })
+    for p in Path(root).glob("organize_report_*.md"):
+        report_base = str(p.with_suffix(""))
+        if report_base in found_report_bases:
+            continue
+        if report_base not in history_by_report:
+            issues.append({
+                "type": "orphan_report",
+                "detail": f"磁盘上的报告无对应历史记录: {p.name}",
+                "path": str(p),
+            })
+
+    # 检查磁盘上的归档日志是否有对应的历史记录
+    for p in Path(root).glob(".organize_log_*.json"):
+        log_path = str(p)
+        if log_path not in history_by_log:
+            issues.append({
+                "type": "orphan_log",
+                "detail": f"磁盘上的归档日志无对应历史记录: {p.name}",
+                "path": log_path,
+            })
+
+    # 检查 MD5 缓存一致性
+    cache, cache_stats_data = _load_md5_cache(root)
+    for path_str in list(cache.keys()):
+        if not _check_dir_exists(path_str):
+            issues.append({
+                "type": "stale_cache",
+                "detail": f"MD5 缓存引用已不存在的文件: {Path(path_str).name}",
+                "path": path_str,
+            })
+
+    if not issues:
+        print("健康检查通过，未发现问题。")
+        return
+
+    print(f"健康检查发现 {len(issues)} 个问题:\n")
+    by_type = defaultdict(list)
+    for iss in issues:
+        by_type[iss["type"]].append(iss)
+
+    type_labels = {
+        "broken_report_link": "断链报告 (历史引用但报告不存在)",
+        "broken_log_link": "断链日志 (历史引用但日志不存在)",
+        "orphan_report": "孤儿报告 (磁盘存在但无历史记录)",
+        "orphan_log": "孤儿日志 (磁盘存在但无历史记录)",
+        "stale_cache": "过期缓存 (缓存引用的文件已不存在)",
+    }
+
+    for t, items in sorted(by_type.items()):
+        label = type_labels.get(t, t)
+        print(f"  [{label}] ({len(items)} 个)")
+        for iss in items:
+            print(f"    - {iss['detail']}")
+        print()
+
+    if clean:
+        cleaned = 0
+        for iss in issues:
+            p = Path(iss["path"])
+            if p.exists():
+                try:
+                    p.unlink()
+                    cleaned += 1
+                except OSError:
+                    pass
+
+        if issues:
+            _clean_stale_cache(cache)
+            _save_md5_cache(root, cache, cache_stats_data)
+
+        print(f"清理完成: 移除了 {cleaned} 个文件/条目")
+    else:
+        print("使用 --health-clean 可自动清理以上问题。")
+
+
+# ============================================================
+#  分析阶段
 # ============================================================
 
 def analyze(root, categories, exclude_patterns, extra_exclude):
@@ -585,7 +820,6 @@ def analyze(root, categories, exclude_patterns, extra_exclude):
 
     classified = classify_files(unique_files, categories)
 
-    # 预测所有会被移动的文件（包含将会被移走的文件，用于推算哪些目录会变空）
     all_moved = list(unique_files)
     for g in duplicate_groups:
         for dup_path in g["duplicates"]:
@@ -609,10 +843,6 @@ def analyze(root, categories, exclude_patterns, extra_exclude):
     }
     return plan
 
-
-# ============================================================
-#  预览计划
-# ============================================================
 
 def preview_plan(plan):
     print("=" * 60)
@@ -676,6 +906,7 @@ def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
     excluded_files = plan["excluded_files"]
     new_files = plan["new_files"]
     category_names = plan["category_names"]
+    predicted_empty_count = len(plan["empty_dir_plan"])
 
     classified = classify_files(unique_files, categories)
 
@@ -707,7 +938,7 @@ def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
         print(f"--- {cat} ({len(file_list)} 个文件) ---")
         _ensure_dir(category_dirs[cat], dry_run)
         for f in file_list:
-            size, dest, conflict = _move_file(f, category_dirs[cat], dry_run, conflict_strategy)
+            size, dest, conflict, backup = _move_file(f, category_dirs[cat], dry_run, conflict_strategy)
             if conflict == "skip":
                 conflict_stats["skip"] += 1
                 move_record.append({
@@ -723,6 +954,8 @@ def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
             if conflict:
                 entry["conflict"] = conflict
                 entry["status"] = "moved_with_conflict"
+            if backup:
+                entry["backup_path"] = backup
             move_record.append(entry)
         print()
 
@@ -732,7 +965,7 @@ def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
         for group in duplicate_groups:
             for dup_path in group["duplicates"]:
                 dup = Path(dup_path)
-                size, dest, conflict = _move_file(dup, duplicates_dir, dry_run, conflict_strategy)
+                size, dest, conflict, backup = _move_file(dup, duplicates_dir, dry_run, conflict_strategy)
                 if conflict == "skip":
                     conflict_stats["skip"] += 1
                     stats["duplicates"] -= 1
@@ -759,13 +992,21 @@ def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
                 if conflict:
                     entry["conflict"] = conflict
                     entry["status"] = "moved_with_conflict"
+                if backup:
+                    entry["backup_path"] = backup
                 move_record.append(entry)
         print()
         print(f"发现 {stats['duplicates']} 个重复文件（{len(duplicate_groups)} 组），已移至 Duplicates/")
         print()
 
     print("--- 清理空文件夹 ---")
-    stats["empty_dirs_removed"] = _cleanup_empty_dirs(root, dry_run)
+    if dry_run:
+        for d in plan["empty_dir_plan"]:
+            print(f"  [DRY-RUN] 将删除空文件夹: {d}")
+        stats["empty_dirs_removed"] = predicted_empty_count
+    else:
+        actual_removed = _cleanup_empty_dirs(root, dry_run)
+        stats["empty_dirs_removed"] = actual_removed
     print()
 
     operate_ts = datetime.now()
@@ -919,8 +1160,13 @@ def _write_report_files(report_base, stats, duplicate_groups, exclude_info):
         "by_category": dict(stats["by_category"]),
         "duplicate_groups": duplicate_groups,
         "excluded_files": [str(p) for p in exclude_info.get("excluded_files", [])],
-        "moves": [{"source": m["source"], "destination": m["dest"], "conflict": m.get("conflict"),
-                    "status": m.get("status", "moved")} for m in stats.get("move_record", [])],
+        "moves": [{
+            "source": m["source"],
+            "destination": m["dest"],
+            "conflict": m.get("conflict"),
+            "backup_path": m.get("backup_path"),
+            "status": m.get("status", "moved"),
+        } for m in stats.get("move_record", [])],
     }
 
     json_path = f"{report_base}.json"
@@ -982,9 +1228,10 @@ def _build_markdown_report(stats, duplicate_groups, exclude_info):
         lines.append("## 文件移动明细")
         lines.append("")
         has_conflicts = any(m.get("conflict") for m in stats["move_record"])
-        if has_conflicts:
-            lines.append("| 源路径 | 目标路径 | 大小 | 冲突处理 |")
-            lines.append("|--------|----------|------|----------|")
+        has_backups = any(m.get("backup_path") for m in stats["move_record"])
+        if has_conflicts or has_backups:
+            lines.append("| 源路径 | 目标路径 | 大小 | 冲突处理 | 备份路径 |")
+            lines.append("|--------|----------|------|----------|----------|")
         else:
             lines.append("| 源路径 | 目标路径 | 大小 |")
             lines.append("|--------|----------|------|")
@@ -993,12 +1240,20 @@ def _build_markdown_report(stats, duplicate_groups, exclude_info):
             dst_name = Path(m["dest"]).name
             size_str = _format_size(m["size"])
             dst_parent = Path(m["dest"]).parent.name
-            if has_conflicts:
+            if has_conflicts or has_backups:
                 conflict_label = CONFLICT_LABELS.get(m.get("conflict", ""), "")
-                if m.get("status") == "skipped":
-                    lines.append(f"| {src_name} | (未移动) | {size_str} | {conflict_label} |")
+                backup_full = m.get("backup_path", "")
+                if backup_full:
+                    try:
+                        backup_rel = str(Path(backup_full).relative_to(Path(stats["root"])))
+                    except (ValueError, OSError):
+                        backup_rel = Path(backup_full).name
                 else:
-                    lines.append(f"| {src_name} | {dst_parent}/{dst_name} | {size_str} | {conflict_label} |")
+                    backup_rel = ""
+                if m.get("status") == "skipped":
+                    lines.append(f"| {src_name} | (未移动) | {size_str} | {conflict_label} | |")
+                else:
+                    lines.append(f"| {src_name} | {dst_parent}/{dst_name} | {size_str} | {conflict_label} | {backup_rel} |")
             else:
                 lines.append(f"| {src_name} | {dst_parent}/{dst_name} | {size_str} |")
         lines.append("")
@@ -1177,6 +1432,36 @@ def main():
         default=DEFAULT_HISTORY_RETENTION_DAYS,
         help=f"历史记录保留天数上限（默认: {DEFAULT_HISTORY_RETENTION_DAYS}）",
     )
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="健康检查：扫描报告/历史/日志/缓存之间的一致性问题",
+    )
+    parser.add_argument(
+        "--health-clean",
+        action="store_true",
+        help="健康检查并自动清理发现的问题",
+    )
+    parser.add_argument(
+        "--cache-stats",
+        action="store_true",
+        help="查看 MD5 缓存统计信息",
+    )
+    parser.add_argument(
+        "--cache-stats-detail",
+        action="store_true",
+        help="查看 MD5 缓存详细条目",
+    )
+    parser.add_argument(
+        "--cache-clean",
+        action="store_true",
+        help="清理 MD5 缓存中的失效条目",
+    )
+    parser.add_argument(
+        "--cache-rebuild",
+        action="store_true",
+        help="强制重建 MD5 缓存",
+    )
 
     args = parser.parse_args()
 
@@ -1190,6 +1475,22 @@ def main():
         download_dir = Path.home() / "Downloads"
         if not download_dir.exists():
             sys.exit(f"默认下载目录不存在: {download_dir}，请手动指定目录路径")
+
+    if args.health_check or args.health_clean:
+        health_check(download_dir, clean=args.health_clean)
+        return
+
+    if args.cache_stats or args.cache_stats_detail:
+        cache_stats(download_dir, detail=args.cache_stats_detail)
+        return
+
+    if args.cache_clean:
+        cache_clean(download_dir)
+        return
+
+    if args.cache_rebuild:
+        cache_rebuild(download_dir)
+        return
 
     if args.history:
         show_history(download_dir)
