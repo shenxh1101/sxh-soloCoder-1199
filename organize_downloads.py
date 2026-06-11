@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -29,10 +29,17 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "organize_report_*.json", "organize_report_*.md",
     ".organize_log.json", ".organize_log_*.json", ".organize_log_*.bak",
     ".organize_history.json",
+    ".organize_md5_cache.json",
 ]
 
 LOG_FILENAME = ".organize_log.json"
 HISTORY_FILENAME = ".organize_history.json"
+MD5_CACHE_FILENAME = ".organize_md5_cache.json"
+
+CONFLICT_STRATEGIES = {"auto_rename", "skip", "overwrite_backup"}
+DEFAULT_CONFLICT_STRATEGY = "auto_rename"
+DEFAULT_HISTORY_RETENTION_COUNT = 30
+DEFAULT_HISTORY_RETENTION_DAYS = 90
 
 
 # ============================================================
@@ -120,24 +127,43 @@ def _ensure_dir(path, dry_run=False):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def _move_file(src, dst_dir, dry_run):
+def _move_file(src, dst_dir, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY):
     dst = Path(dst_dir) / src.name
+    conflict_action = None
+
     if Path(src).resolve() == dst.resolve():
-        return 0, str(src)
+        return 0, str(src), conflict_action
+
     if dst.exists():
-        stem = dst.stem
-        suffix = dst.suffix
-        counter = 1
-        while dst.exists():
-            dst = Path(dst_dir) / f"{stem}_{counter}{suffix}"
-            counter += 1
+        if conflict_strategy == "skip":
+            print(f"  {'[DRY-RUN] 将' if dry_run else ''}跳过(冲突): {src.name}")
+            return 0, str(src), "skip"
+        elif conflict_strategy == "overwrite_backup":
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            bak = dst.parent / f"{dst.stem}.bak_{ts}{dst.suffix}"
+            print(f"  {'[DRY-RUN] 将' if dry_run else ''}备份: {dst.name} -> {bak.name}")
+            if not dry_run:
+                shutil.move(str(dst), str(bak))
+            conflict_action = "overwrite_backup"
+        else:
+            stem = dst.stem
+            suffix = dst.suffix
+            counter = 1
+            while dst.exists():
+                dst = Path(dst_dir) / f"{stem}_{counter}{suffix}"
+                counter += 1
+            conflict_action = "auto_rename"
 
     size = src.stat().st_size
-    print(f"  {'[DRY-RUN] 将' if dry_run else ''}移动: {src.name} -> {dst.parent.name}/{dst.name}")
+    tag = "[DRY-RUN] 将" if dry_run else ""
+    if conflict_action:
+        print(f"  {tag}移动: {src.name} -> {dst.parent.name}/{dst.name}  (冲突: {conflict_action})")
+    else:
+        print(f"  {tag}移动: {src.name} -> {dst.parent.name}/{dst.name}")
 
     if not dry_run:
         shutil.move(str(src), str(dst))
-    return size, str(dst)
+    return size, str(dst), conflict_action
 
 
 def _format_size(size_bytes):
@@ -180,8 +206,123 @@ def _cleanup_empty_dirs(root, dry_run):
     return total_removed
 
 
+def _check_dir_exists(path):
+    try:
+        return Path(path).exists()
+    except OSError:
+        return False
+
+
 # ============================================================
-#  智能判重 — 纳入已有分类目录中的旧文件
+#  预测空目录 — 模拟移动后哪些目录会变空
+# ============================================================
+
+def _predict_empty_dirs(root, category_names, moved_sources):
+    root = Path(root)
+    moved_set = {str(p.resolve()) for p in moved_sources if _check_dir_exists(p)}
+
+    dir_files_map = defaultdict(set)
+    for entry in root.rglob("*"):
+        if entry.is_file():
+            entry_dir = entry.parent
+            dir_files_map[entry_dir].add(str(entry.resolve()))
+
+    dir_hierarchy = defaultdict(set)
+    for d in dir_files_map:
+        parent = d.parent
+        while parent != root.parent and parent != parent.parent:
+            dir_hierarchy[parent].add(d)
+            parent = parent.parent
+
+    empty_after_move = set()
+    fully_moved = set()
+    for d, files in dir_files_map.items():
+        if files and files.issubset(moved_set):
+            fully_moved.add(d)
+
+    will_be_empty = set()
+    for d in fully_moved:
+        if d.name not in category_names:
+            will_be_empty.add(d)
+
+    current_empty = {d for d in _collect_empty_dirs(root)}
+
+    changed = True
+    max_passes = 10
+    for _ in range(max_passes):
+        if not changed:
+            break
+        changed = False
+        for d in list(dir_hierarchy.keys()):
+            if d in will_be_empty or d in current_empty:
+                continue
+            children = dir_hierarchy[d]
+            if children and all(
+                c in will_be_empty or c in current_empty
+                for c in children
+            ):
+                if d.name not in category_names:
+                    will_be_empty.add(d)
+                    changed = True
+
+    predicted = current_empty | will_be_empty
+    return sorted(predicted, key=lambda p: len(Path(p).parts), reverse=True)
+
+
+# ============================================================
+#  MD5 缓存
+# ============================================================
+
+def _load_md5_cache(root):
+    cache_path = Path(root) / MD5_CACHE_FILENAME
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_md5_cache(root, cache):
+    cache_path = Path(root) / MD5_CACHE_FILENAME
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def _get_md5_cached(file_path, cache):
+    path_str = str(file_path)
+    try:
+        stat = file_path.stat()
+        size = stat.st_size
+        mtime = stat.st_mtime
+    except OSError:
+        return None, False
+
+    entry = cache.get(path_str)
+    if entry and entry.get("size") == size and entry.get("mtime") == mtime:
+        return entry.get("md5"), True
+
+    md5 = _compute_md5(file_path)
+    if md5:
+        cache[path_str] = {"md5": md5, "size": size, "mtime": mtime}
+    return md5, False
+
+
+def _clean_stale_cache(cache):
+    stale = []
+    for path_str in list(cache.keys()):
+        if not _check_dir_exists(path_str):
+            stale.append(path_str)
+    for s in stale:
+        del cache[s]
+
+
+# ============================================================
+#  智能判重
 # ============================================================
 
 def _scan_existing_category_files(root, category_dirs):
@@ -196,14 +337,28 @@ def _scan_existing_category_files(root, category_dirs):
     return existing
 
 
-def _build_existing_md5_index(existing_files):
+def _build_existing_md5_index(existing_files, root):
+    cache = _load_md5_cache(root)
     index = {}
+    cache_hits = 0
+    cache_misses = 0
+
     for path_str, file_path in sorted(existing_files.items()):
-        md5 = _compute_md5(file_path)
+        md5, is_hit = _get_md5_cached(file_path, cache)
         if md5 is None:
             continue
+        if is_hit:
+            cache_hits += 1
+        else:
+            cache_misses += 1
         if md5 not in index:
             index[md5] = file_path
+
+    _clean_stale_cache(cache)
+    _save_md5_cache(root, cache)
+
+    if cache_hits + cache_misses > 0:
+        print(f"  MD5 缓存: {cache_hits} 命中, {cache_misses} 重算, 共 {len(index)} 个唯一文件")
     return index
 
 
@@ -217,7 +372,6 @@ def _global_dedup_with_existing(new_files, existing_md5_index):
 
     unique_files = []
     duplicate_groups = []
-    matched_existing = []
 
     for md5_hash, paths in new_md5_map.items():
         existing_file = existing_md5_index.get(md5_hash)
@@ -231,7 +385,6 @@ def _global_dedup_with_existing(new_files, existing_md5_index):
                     "duplicates": [str(dup)],
                     "duplicate_size": dup.stat().st_size,
                 })
-                matched_existing.append(str(existing_file))
         elif len(paths) == 1:
             unique_files.append(paths[0])
         else:
@@ -249,7 +402,7 @@ def _global_dedup_with_existing(new_files, existing_md5_index):
 
 
 # ============================================================
-#  历史管理
+#  历史管理与保留策略
 # ============================================================
 
 def _load_history(root):
@@ -269,10 +422,73 @@ def _save_history(root, entries):
         json.dump(entries, f, ensure_ascii=False, indent=2)
 
 
-def _append_history_entry(root, ts, stats, duplicate_groups, report_base, log_backup_path):
+def _prune_history(root, entries, max_count=None, max_days=None):
+    if not max_count and not max_days:
+        return entries, []
+
+    cutoff_date = None
+    if max_days:
+        cutoff_date = datetime.now() - timedelta(days=max_days)
+
+    expired = []
+    kept = []
+
+    for e in entries:
+        ts_str = e.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            kept.append(e)
+            continue
+
+        if cutoff_date and ts < cutoff_date:
+            expired.append(e)
+        else:
+            kept.append(e)
+
+    if max_count and len(kept) > max_count:
+        by_ts = sorted(kept, key=lambda e: e.get("timestamp", ""))
+        to_keep = by_ts[-max_count:]
+        expired.extend(e for e in kept if e not in to_keep)
+        kept = to_keep
+
+    return kept, expired
+
+
+def _cleanup_expired_history(root, expired):
+    for e in expired:
+        report_base = e.get("report_base", "")
+        for ext in [".json", ".md"]:
+            p = Path(f"{report_base}{ext}")
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+        log_path = e.get("log_backup")
+        if log_path:
+            lp = Path(log_path)
+            if lp.exists():
+                try:
+                    lp.unlink()
+                except OSError:
+                    pass
+
+
+def _append_history_entry(root, ts, stats, report_base, log_backup_path,
+                          retention_count=None, retention_days=None):
     entries = _load_history(root)
+
+    entries, expired = _prune_history(root, entries, retention_count, retention_days)
+    _cleanup_expired_history(root, expired)
+
+    if expired:
+        print(f"历史清理: 移除了 {len(expired)} 条过期记录")
+
+    next_index = max((e["index"] for e in entries), default=0) + 1
     entry = {
-        "index": len(entries) + 1,
+        "index": next_index,
         "timestamp": ts.isoformat(),
         "total_files": stats["total_files"],
         "duplicates": stats["duplicates"],
@@ -363,13 +579,19 @@ def analyze(root, categories, exclude_patterns, extra_exclude):
             new_files.append(entry)
 
     existing_files = _scan_existing_category_files(root, category_dirs)
-    existing_md5_index = _build_existing_md5_index(existing_files)
+    existing_md5_index = _build_existing_md5_index(existing_files, root)
 
     unique_files, duplicate_groups = _global_dedup_with_existing(new_files, existing_md5_index)
 
     classified = classify_files(unique_files, categories)
 
-    empty_dir_plan = _collect_empty_dirs(root)
+    # 预测所有会被移动的文件（包含将会被移走的文件，用于推算哪些目录会变空）
+    all_moved = list(unique_files)
+    for g in duplicate_groups:
+        for dup_path in g["duplicates"]:
+            all_moved.append(Path(dup_path))
+
+    empty_dir_plan = _predict_empty_dirs(root, category_names, all_moved)
 
     plan = {
         "root": root,
@@ -431,7 +653,7 @@ def preview_plan(plan):
         print()
 
     if plan["empty_dir_plan"]:
-        print("将清理的空目录:")
+        print("将清理的空目录（含移动后会变空的目录）:")
         for d in plan["empty_dir_plan"]:
             print(f"  - {d}")
         print()
@@ -443,7 +665,8 @@ def preview_plan(plan):
 #  执行阶段
 # ============================================================
 
-def execute(plan, dry_run):
+def execute(plan, dry_run, conflict_strategy=DEFAULT_CONFLICT_STRATEGY,
+            retention_count=None, retention_days=None):
     root = plan["root"]
     category_dirs = plan["category_dirs"]
     duplicates_dir = plan["duplicates_dir"]
@@ -459,6 +682,7 @@ def execute(plan, dry_run):
     total_files = len(new_files) + len(excluded_files)
 
     move_record = []
+    conflict_stats = {"auto_rename": 0, "skip": 0, "overwrite_backup": 0}
     stats = {
         "root": str(root),
         "total_files": total_files,
@@ -470,6 +694,7 @@ def execute(plan, dry_run):
         "freed_space": 0,
         "by_category": defaultdict(int),
         "move_record": move_record,
+        "conflict_stats": conflict_stats,
     }
 
     for cat in sorted(category_names):
@@ -482,10 +707,23 @@ def execute(plan, dry_run):
         print(f"--- {cat} ({len(file_list)} 个文件) ---")
         _ensure_dir(category_dirs[cat], dry_run)
         for f in file_list:
-            size, dest = _move_file(f, category_dirs[cat], dry_run)
+            size, dest, conflict = _move_file(f, category_dirs[cat], dry_run, conflict_strategy)
+            if conflict == "skip":
+                conflict_stats["skip"] += 1
+                move_record.append({
+                    "source": str(f), "dest": dest, "size": size,
+                    "conflict": "skip", "status": "skipped",
+                })
+                continue
+            if conflict:
+                conflict_stats[conflict] += 1
             stats["moved"] += 1
             stats["by_category"][cat] += 1
-            move_record.append({"source": str(f), "dest": dest, "size": size})
+            entry = {"source": str(f), "dest": dest, "size": size}
+            if conflict:
+                entry["conflict"] = conflict
+                entry["status"] = "moved_with_conflict"
+            move_record.append(entry)
         print()
 
     if duplicate_groups:
@@ -494,18 +732,34 @@ def execute(plan, dry_run):
         for group in duplicate_groups:
             for dup_path in group["duplicates"]:
                 dup = Path(dup_path)
-                size, dest = _move_file(dup, duplicates_dir, dry_run)
+                size, dest, conflict = _move_file(dup, duplicates_dir, dry_run, conflict_strategy)
+                if conflict == "skip":
+                    conflict_stats["skip"] += 1
+                    stats["duplicates"] -= 1
+                    move_record.append({
+                        "source": str(dup), "dest": dest, "size": size,
+                        "conflict": "skip", "status": "skipped",
+                        "is_duplicate": True,
+                        "duplicate_of": group["kept"],
+                    })
+                    continue
+                if conflict:
+                    conflict_stats[conflict] += 1
                 stats["freed_space"] += size
                 stats["moved"] += 1
                 stats["by_category"]["Duplicates"] += 1
                 kept_note = " (已有)" if group.get("kept_is_existing") else ""
-                move_record.append({
+                entry = {
                     "source": str(dup),
                     "dest": dest,
                     "size": size,
                     "is_duplicate": True,
                     "duplicate_of": group["kept"] + kept_note,
-                })
+                }
+                if conflict:
+                    entry["conflict"] = conflict
+                    entry["status"] = "moved_with_conflict"
+                move_record.append(entry)
         print()
         print(f"发现 {stats['duplicates']} 个重复文件（{len(duplicate_groups)} 组），已移至 Duplicates/")
         print()
@@ -531,8 +785,9 @@ def execute(plan, dry_run):
         print(f"恢复本次: python organize_downloads.py --undo \"{root}\"")
 
         _append_history_entry(
-            root, operate_ts, stats, duplicate_groups,
-            report_base, str(archived_log_path)
+            root, operate_ts, stats, report_base, str(archived_log_path),
+            retention_count=retention_count if retention_count is not None else DEFAULT_HISTORY_RETENTION_COUNT,
+            retention_days=retention_days if retention_days is not None else DEFAULT_HISTORY_RETENTION_DAYS,
         )
         print(f"历史记录已更新: {HISTORY_FILENAME}")
 
@@ -615,6 +870,7 @@ def _execute_undo(root, log_data):
 # ============================================================
 
 def generate_report(stats, duplicate_groups, exclude_info, report_base):
+    conflict_stats = stats.get("conflict_stats", {})
     lines = []
     lines.append("=" * 60)
     lines.append("整理报告")
@@ -627,6 +883,11 @@ def generate_report(stats, duplicate_groups, exclude_info, report_base):
     lines.append(f"  已移动文件数:      {stats['moved']}")
     lines.append(f"  已删除空文件夹:    {stats['empty_dirs_removed']}")
     lines.append(f"  释放空间(重复):    {_format_size(stats['freed_space'])}")
+    if conflict_stats:
+        lines.append(f"  冲突处理:          "
+                     f"自动重命名 {conflict_stats.get('auto_rename', 0)}, "
+                     f"跳过 {conflict_stats.get('skip', 0)}, "
+                     f"覆盖前备份 {conflict_stats.get('overwrite_backup', 0)}")
     lines.append("-" * 60)
     lines.append("按类别统计:")
     for cat in sorted(stats["by_category"]):
@@ -654,10 +915,12 @@ def _write_report_files(report_base, stats, duplicate_groups, exclude_info):
         "empty_dirs_removed": stats["empty_dirs_removed"],
         "freed_space_bytes": stats["freed_space"],
         "freed_space_human": _format_size(stats["freed_space"]),
+        "conflict_stats": stats.get("conflict_stats", {}),
         "by_category": dict(stats["by_category"]),
         "duplicate_groups": duplicate_groups,
         "excluded_files": [str(p) for p in exclude_info.get("excluded_files", [])],
-        "moves": [{"source": m["source"], "destination": m["dest"]} for m in stats.get("move_record", [])],
+        "moves": [{"source": m["source"], "destination": m["dest"], "conflict": m.get("conflict"),
+                    "status": m.get("status", "moved")} for m in stats.get("move_record", [])],
     }
 
     json_path = f"{report_base}.json"
@@ -672,7 +935,15 @@ def _write_report_files(report_base, stats, duplicate_groups, exclude_info):
     print(f"Markdown 报告已保存: {md_path}")
 
 
+CONFLICT_LABELS = {
+    "auto_rename": "自动重命名",
+    "skip": "跳过",
+    "overwrite_backup": "覆盖前备份",
+}
+
+
 def _build_markdown_report(stats, duplicate_groups, exclude_info):
+    conflict_stats = stats.get("conflict_stats", {})
     lines = []
     lines.append("# 下载文件夹整理报告")
     lines.append("")
@@ -690,6 +961,11 @@ def _build_markdown_report(stats, duplicate_groups, exclude_info):
     lines.append(f"| 已移动文件数 | {stats['moved']} |")
     lines.append(f"| 已删除空文件夹 | {stats['empty_dirs_removed']} |")
     lines.append(f"| 释放空间(重复) | {_format_size(stats['freed_space'])} |")
+    if conflict_stats:
+        conflict_summary = ", ".join(
+            f"{CONFLICT_LABELS.get(k, k)} {v}" for k, v in conflict_stats.items() if v
+        )
+        lines.append(f"| 冲突处理 | {conflict_summary} |")
     lines.append("")
 
     lines.append("## 按类别统计")
@@ -705,12 +981,26 @@ def _build_markdown_report(stats, duplicate_groups, exclude_info):
     if stats.get("move_record"):
         lines.append("## 文件移动明细")
         lines.append("")
-        lines.append("| 源路径 | 目标路径 | 大小 |")
-        lines.append("|--------|----------|------|")
+        has_conflicts = any(m.get("conflict") for m in stats["move_record"])
+        if has_conflicts:
+            lines.append("| 源路径 | 目标路径 | 大小 | 冲突处理 |")
+            lines.append("|--------|----------|------|----------|")
+        else:
+            lines.append("| 源路径 | 目标路径 | 大小 |")
+            lines.append("|--------|----------|------|")
         for m in stats["move_record"]:
             src_name = Path(m["source"]).name
             dst_name = Path(m["dest"]).name
-            lines.append(f"| {src_name} | {Path(m['dest']).parent.name}/{dst_name} | {_format_size(m['size'])} |")
+            size_str = _format_size(m["size"])
+            dst_parent = Path(m["dest"]).parent.name
+            if has_conflicts:
+                conflict_label = CONFLICT_LABELS.get(m.get("conflict", ""), "")
+                if m.get("status") == "skipped":
+                    lines.append(f"| {src_name} | (未移动) | {size_str} | {conflict_label} |")
+                else:
+                    lines.append(f"| {src_name} | {dst_parent}/{dst_name} | {size_str} | {conflict_label} |")
+            else:
+                lines.append(f"| {src_name} | {dst_parent}/{dst_name} | {size_str} |")
         lines.append("")
 
     if duplicate_groups:
@@ -743,7 +1033,8 @@ def _build_markdown_report(stats, duplicate_groups, exclude_info):
 #  主流程
 # ============================================================
 
-def organize(download_dir, config_path, dry_run, extra_exclude, confirm):
+def organize(download_dir, config_path, dry_run, extra_exclude, confirm, conflict_strategy,
+             retention_count=None, retention_days=None):
     if yaml is None:
         sys.exit("缺少 PyYAML 依赖，请执行: pip install pyyaml")
 
@@ -776,7 +1067,7 @@ def organize(download_dir, config_path, dry_run, extra_exclude, confirm):
     if dry_run:
         preview_plan(plan)
 
-    execute(plan, dry_run)
+    execute(plan, dry_run, conflict_strategy, retention_count, retention_days)
 
 
 def undo(directory):
@@ -826,7 +1117,7 @@ def main():
     parser.add_argument(
         "--dry-run", "-n",
         action="store_true",
-        help="演练模式：只打印将要执行的操作，不实际移动文件",
+        help="演练模式：只打印将要执行的操作，不实际修改文件",
     )
     parser.add_argument(
         "--exclude", "-e",
@@ -838,6 +1129,12 @@ def main():
         "--confirm",
         action="store_true",
         help="确认模式：先预览完整计划，确认后再实际执行",
+    )
+    parser.add_argument(
+        "--on-conflict",
+        choices=sorted(CONFLICT_STRATEGIES),
+        default=DEFAULT_CONFLICT_STRATEGY,
+        help=f"文件名冲突处理策略: auto_rename(默认), skip, overwrite_backup",
     )
     parser.add_argument(
         "--generate-config",
@@ -865,6 +1162,20 @@ def main():
         metavar="INDEX",
         type=int,
         help="恢复指定编号的整理操作",
+    )
+    parser.add_argument(
+        "--history-retention-count",
+        metavar="N",
+        type=int,
+        default=DEFAULT_HISTORY_RETENTION_COUNT,
+        help=f"历史记录保留数量上限（默认: {DEFAULT_HISTORY_RETENTION_COUNT}）",
+    )
+    parser.add_argument(
+        "--history-retention-days",
+        metavar="N",
+        type=int,
+        default=DEFAULT_HISTORY_RETENTION_DAYS,
+        help=f"历史记录保留天数上限（默认: {DEFAULT_HISTORY_RETENTION_DAYS}）",
     )
 
     args = parser.parse_args()
@@ -902,6 +1213,9 @@ def main():
         dry_run=args.dry_run,
         extra_exclude=args.exclude,
         confirm=args.confirm,
+        conflict_strategy=args.on_conflict,
+        retention_count=args.history_retention_count,
+        retention_days=args.history_retention_days,
     )
 
 
